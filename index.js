@@ -552,7 +552,10 @@ app.patch('/api/installments/:id/pay', async (req, res) => {
 
 
 
-
+// Add this simple route for Railway's health check
+app.get('/', (req, res) => {
+    res.send('Real Estate ERP Backend is Live and Running!');
+});
 
 
 
