@@ -564,7 +564,7 @@ app.get('/', (req, res) => {
 
 ///////////////////////////////////////////////////////////////////////////////////////////
 // Start Server
-// We are adding '0.0.0.0' to tell the server to accept outside traffic
+// Triggering Railway redeploy to fix port binding
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server is running on port ${PORT}`);
 });
