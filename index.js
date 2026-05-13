@@ -1,3 +1,4 @@
+require('dotenv').config(); // <-- Added this to the very top to be safe
 const express = require('express');
 const cors = require('cors');
 const db = require('./config/db');
