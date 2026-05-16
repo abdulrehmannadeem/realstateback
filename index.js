@@ -255,7 +255,7 @@ app.post('/api/clients', async (req, res) => {
          }
          res.status(500).json({ error: error.message });
      }
- });
+ });c
 
 app.get('/api/clients/:id/bookings', async (req, res) => {
     try {
@@ -401,8 +401,8 @@ app.post('/api/bookings', async (req, res) => {
                 const dueDate = new Date(booking_date);
                 dueDate.setMonth(dueDate.getMonth() + i);
                 await conn.execute(
-                    'INSERT INTO installment (amount_due, amount_paid, due_date, status, client_plot_id) VALUES (?, 0.00, ?, "Pending", ?)',
-                    [installmentAmount, dueDate.toISOString().split('T')[0], bookingId]
+'INSERT INTO installment (amount_due, amount_paid, due_date, status, client_plot_id) VALUES (?, 0.00, ?, ?, ?)',
+[installmentAmount, dueDate.toISOString().split('T')[0], 'Pending', bookingId]
                 );
             }
         }
