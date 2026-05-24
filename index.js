@@ -255,7 +255,7 @@ app.post('/api/clients', async (req, res) => {
          }
          res.status(500).json({ error: error.message });
      }
- });c
+ });
 
 app.get('/api/clients/:id/bookings', async (req, res) => {
     try {
@@ -544,19 +544,6 @@ app.patch('/api/installments/:id/pay', async (req, res) => {
     }
 });
 
-
-
-
-
-
-
-
-
-
-// Add this simple route for Railway's health check
-app.get('/', (req, res) => {
-    res.send('Real Estate ERP Backend is Live and Running!');
-});
 
 
 
