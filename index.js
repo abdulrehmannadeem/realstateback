@@ -418,15 +418,16 @@ app.post('/api/bookings', async (req, res) => {
         const clientName = clientRow[0]?.name || 'Unknown';
         const plotName = plotRow[0]?.name || 'Unknown';
 
-        await conn.execute(
-            'INSERT INTO wallet_transaction (amount, transaction_type, description, wallet_id, user_id) VALUES (?, "credit", ?, ?, ?)',
-            [
-                isInstallment ? downpayment : total_price,
-                `${clientName} - Plot ${plotName}`,
-                walletId,
-                user_id
-            ]
-        );
+await conn.execute(
+    'INSERT INTO wallet_transaction (amount, transaction_type, description, wallet_id, user_id) VALUES (?, ?, ?, ?, ?)',
+    [
+        isInstallment ? downpayment : total_price,
+        'credit', // <-- Moved safely down here as a clean text parameter
+        `${clientName} - Plot ${plotName}`,
+        walletId,
+        user_id
+    ]
+);
  
          await conn.commit();
          res.status(201).json({ id: bookingId, message: isInstallment ? `Booked with ${cycles} installments generated.` : 'Booked with full payment.' });
