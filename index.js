@@ -522,16 +522,16 @@ app.patch('/api/installments/:id/pay', async (req, res) => {
         if (wallet.length === 0) throw new Error('No wallet found');
         const walletId = wallet[0].id;
 
-        await conn.execute(
-            `INSERT INTO wallet_transaction (amount, transaction_type, description, wallet_id, user_id)
-             VALUES (?, 'credit', ?, ?, ?)`,
-            [
-                amount_paid,
-                `${installment.client_name} - Plot ${installment.plot_name}`,
-                walletId,
-                user_id
-            ]
-        );
+await conn.execute(
+    'INSERT INTO wallet_transaction (amount, transaction_type, description, wallet_id, user_id) VALUES (?, ?, ?, ?, ?)',
+    [
+        isInstallment ? downpayment : total_price,
+        'credit', // <-- Safely passed as a proper string parameter
+        `${clientName} - Plot ${plotName}`,
+        walletId,
+        user_id
+    ]
+);
 
         await conn.commit();
         res.json({ message: `Installment marked as ${status}` });
