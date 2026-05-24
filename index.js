@@ -523,12 +523,14 @@ app.patch('/api/installments/:id/pay', async (req, res) => {
         if (wallet.length === 0) throw new Error('No wallet found');
         const walletId = wallet[0].id;
 
+// --- INSIDE app.patch('/api/installments/:id/pay') ---
+
 await conn.execute(
     'INSERT INTO wallet_transaction (amount, transaction_type, description, wallet_id, user_id) VALUES (?, ?, ?, ?, ?)',
     [
-        isInstallment ? downpayment : total_price,
-        'credit', // <-- Safely passed as a proper string parameter
-        `${clientName} - Plot ${plotName}`,
+        amount_paid, // 🟢 FIXED: Directly use amount_paid here (no isInstallment condition!)
+        'credit',
+        `${installment.client_name} - Plot ${installment.plot_name}`,
         walletId,
         user_id
     ]
