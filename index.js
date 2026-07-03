@@ -652,6 +652,8 @@ app.get('/api/installments/:client_plot_id', async (req, res) => {
 });
 
 // PATCH /api/installments/:id/pay
+// If this is the last unpaid installment and payment is partial,
+// auto-creates a new installment row for the remaining balance due 1 month later.
 app.patch('/api/installments/:id/pay', async (req, res) => {
     const conn = await db.getConnection();
     try {
@@ -678,6 +680,33 @@ app.patch('/api/installments/:id/pay', async (req, res) => {
             'UPDATE installment SET amount_paid = ?, status = ? WHERE id = ?',
             [newAmountPaid, status, id]
         );
+
+        // ── Option A: if this is the last unpaid installment and still partial,
+        //    carry the remaining balance forward as a new Pending installment ──
+        if (status === 'Partial') {
+            const [allInsts] = await conn.execute(
+                'SELECT * FROM installment WHERE client_plot_id = ? ORDER BY due_date ASC',
+                [installment.client_plot_id]
+            );
+
+            // Siblings = other Pending/Partial installments (excluding current)
+            const pendingOrPartialSiblings = allInsts.filter(
+                (i) => i.id !== parseInt(id) && (i.status === 'Pending' || i.status === 'Partial')
+            );
+
+            // Only carry forward if this is the LAST unpaid installment
+            if (pendingOrPartialSiblings.length === 0) {
+                const remaining = parseFloat(installment.amount_due) - newAmountPaid;
+                const lastDueDate = new Date(installment.due_date);
+                lastDueDate.setMonth(lastDueDate.getMonth() + 1);
+                const newDueDate = lastDueDate.toISOString().split('T')[0];
+
+                await conn.execute(
+                    'INSERT INTO installment (amount_due, amount_paid, due_date, status, client_plot_id) VALUES (?, 0.00, ?, ?, ?)',
+                    [remaining, newDueDate, 'Pending', installment.client_plot_id]
+                );
+            }
+        }
 
         const [wallet] = await conn.execute(
             'SELECT id FROM wallet WHERE organization_id = (SELECT organization_id FROM app_user WHERE id = ?)',
@@ -720,7 +749,6 @@ app.put('/api/installments/:id', async (req, res) => {
 
         await conn.beginTransaction();
 
-        // Fetch the installment to get its client_plot_id and current amount_due
         const [instRows] = await conn.execute(
             'SELECT * FROM installment WHERE id = ?',
             [id]
