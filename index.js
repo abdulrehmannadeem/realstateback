@@ -652,8 +652,10 @@ app.get('/api/installments/:client_plot_id', async (req, res) => {
 });
 
 // PATCH /api/installments/:id/pay
-// If this is the last unpaid installment and payment is partial,
-// auto-creates a new installment row for the remaining balance due 1 month later.
+// Records a payment against an installment. Any shortfall or surplus versus
+// amount_due is spread evenly across the remaining Pending/Partial siblings.
+// If this was the last unpaid installment and it's still short, a new
+// installment row is auto-created for the remaining balance, due 1 month later.
 app.patch('/api/installments/:id/pay', async (req, res) => {
     const conn = await db.getConnection();
     try {
@@ -681,30 +683,47 @@ app.patch('/api/installments/:id/pay', async (req, res) => {
             [newAmountPaid, status, id]
         );
 
-        // ── Option A: if this is the last unpaid installment and still partial,
-        //    carry the remaining balance forward as a new Pending installment ──
-        if (status === 'Partial') {
+        // ── Auto-adjust remaining installments for any shortfall/surplus on this payment ──
+        const diff = parseFloat(installment.amount_due) - newAmountPaid; // >0 shortfall, <0 surplus
+        if (diff !== 0) {
             const [allInsts] = await conn.execute(
                 'SELECT * FROM installment WHERE client_plot_id = ? ORDER BY due_date ASC',
                 [installment.client_plot_id]
             );
 
-            // Siblings = other Pending/Partial installments (excluding current)
-            const pendingOrPartialSiblings = allInsts.filter(
-                (i) => i.id !== parseInt(id) && (i.status === 'Pending' || i.status === 'Partial')
+            // Is this installment the last one in the schedule by due_date?
+            const maxDueDate = allInsts.reduce(
+                (max, i) => (new Date(i.due_date) > new Date(max) ? i.due_date : max),
+                allInsts[0].due_date
             );
+            const isLastInstallment = new Date(installment.due_date).getTime() === new Date(maxDueDate).getTime();
 
-            // Only carry forward if this is the LAST unpaid installment
-            if (pendingOrPartialSiblings.length === 0) {
-                const remaining = parseFloat(installment.amount_due) - newAmountPaid;
+            if (isLastInstallment && status === 'Partial') {
+                // Last installment in the schedule is still short: add one extra row for the shortfall,
+                // regardless of whether earlier installments are Paid or Partial.
                 const lastDueDate = new Date(installment.due_date);
                 lastDueDate.setMonth(lastDueDate.getMonth() + 1);
                 const newDueDate = lastDueDate.toISOString().split('T')[0];
 
                 await conn.execute(
                     'INSERT INTO installment (amount_due, amount_paid, due_date, status, client_plot_id) VALUES (?, 0.00, ?, ?, ?)',
-                    [remaining, newDueDate, 'Pending', installment.client_plot_id]
+                    [diff, newDueDate, 'Pending', installment.client_plot_id]
                 );
+            } else {
+                // Not the last installment: spread the shortfall/surplus evenly across remaining Pending/Partial siblings
+                const siblings = allInsts.filter(
+                    (i) => i.id !== parseInt(id) && (i.status === 'Pending' || i.status === 'Partial')
+                );
+                if (siblings.length > 0) {
+                    const share = parseFloat((diff / siblings.length).toFixed(2));
+                    for (const sib of siblings) {
+                        const newDue = Math.max(0, parseFloat(sib.amount_due) + share);
+                        await conn.execute(
+                            'UPDATE installment SET amount_due = ? WHERE id = ?',
+                            [newDue, sib.id]
+                        );
+                    }
+                }
             }
         }
 
