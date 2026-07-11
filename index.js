@@ -4,6 +4,20 @@ const cors = require('cors');
 const db = require('./config/db');
 const bcrypt = require('bcrypt');
 
+// Splits `total` into `count` currency-safe (2-decimal) parts that always sum
+// exactly to `total` — the last part absorbs any rounding remainder. This
+// prevents the "Rs 0.02 left over" drift that plain division + toFixed(2)
+// causes when splitting amounts across several installments.
+function splitAmountEvenly(total, count) {
+    const sign = total < 0 ? -1 : 1;
+    const absTotal = Math.abs(total);
+    const base = Math.floor((absTotal / count) * 100) / 100;
+    const parts = new Array(count).fill(sign * base);
+    const allocated = base * (count - 1);
+    parts[count - 1] = sign * parseFloat((absTotal - allocated).toFixed(2));
+    return parts;
+}
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -194,6 +208,24 @@ app.get('/api/transactions/:wallet_id', async (req, res) => {
     }
 });
 
+// PUT /api/transactions/:id
+// Updates only the description/remarks on a transaction receipt. Amount,
+// transaction_type, and wallet balances are untouched — this is purely a
+// label/note correction, not a financial change.
+app.put('/api/transactions/:id', async (req, res) => {
+    try {
+        const { description } = req.body;
+        const [result] = await db.execute(
+            'UPDATE wallet_transaction SET description = ? WHERE id = ?',
+            [description, req.params.id]
+        );
+        if (result.affectedRows === 0) return res.status(404).json({ message: 'Transaction not found' });
+        res.json({ message: 'Description updated successfully' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.delete('/api/transactions/:id', async (req, res) => {
     try {
         const transactionId = req.params.id;
@@ -302,7 +334,20 @@ app.get('/api/plots', async (req, res) => {
     try {
         const { organization_id } = req.query;
         const [rows] = await db.execute(
-            `SELECT p.* FROM plot p
+            `SELECT p.*,
+                CASE
+                    WHEN p.is_sold = FALSE THEN 'available'
+                    WHEN EXISTS (
+                        SELECT 1 FROM client_plot cp
+                        WHERE cp.plot_id = p.id AND cp.booking_type = 'purchase'
+                        AND EXISTS (
+                            SELECT 1 FROM installment i
+                            WHERE i.client_plot_id = cp.id AND i.status != 'Paid'
+                        )
+                    ) THEN 'purchased'
+                    ELSE 'sold'
+                END AS status
+             FROM plot p
              JOIN society s ON p.society_id = s.id
              WHERE s.organization_id = ?`,
             [organization_id]
@@ -474,6 +519,39 @@ app.get('/api/sales/form-data', async (req, res) => {
     }
 });
 
+// --- PURCHASE PAGE DATA FETCH (mirrors /api/sales/form-data, same availability filter) ---
+
+app.get('/api/purchases/form-data', async (req, res) => {
+    try {
+        const { society_id, organization_id } = req.query;
+        const [clients] = await db.execute(
+            'SELECT id, name, phone_number, cnic, default_commission FROM client WHERE organization_id = ?',
+            [organization_id]
+        );
+        const [societies] = await db.execute(
+            'SELECT id, name, city FROM society WHERE organization_id = ?',
+            [organization_id]
+        );
+        let plots;
+        if (society_id) {
+            [plots] = await db.execute(
+                'SELECT id, name, block, size, base_cost FROM plot WHERE society_id = ? AND is_sold = FALSE',
+                [society_id]
+            );
+        } else {
+            [plots] = await db.execute(
+                `SELECT p.id, p.name, p.block, p.size, p.base_cost FROM plot p
+                 JOIN society s ON p.society_id = s.id
+                 WHERE s.organization_id = ? AND p.is_sold = FALSE`,
+                [organization_id]
+            );
+        }
+        res.json({ clients, societies, plots });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.post('/api/bookings', async (req, res) => {
     const conn = await db.getConnection();
     try {
@@ -493,9 +571,13 @@ app.post('/api/bookings', async (req, res) => {
 
         await conn.beginTransaction();
 
+        const [plotCheck] = await conn.execute('SELECT is_sold FROM plot WHERE id = ?', [plot_id]);
+        if (plotCheck.length === 0) throw new Error('Plot not found');
+        if (plotCheck[0].is_sold) throw new Error('Plot not available for sale — already sold or purchase installments pending');
+
         const [bookingResult] = await conn.execute(
-            'INSERT INTO client_plot (total_price, downpayment, agreed_commission, booking_date, cycles, client_id, plot_id, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-            [total_price, downpayment, agreed_commission, booking_date, cycles ?? 0, client_id, plot_id, user_id]
+            'INSERT INTO client_plot (total_price, downpayment, agreed_commission, booking_date, cycles, client_id, plot_id, user_id, payment_method) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [total_price, downpayment, agreed_commission, booking_date, cycles ?? 0, client_id, plot_id, user_id, payment_method]
         );
         const bookingId = bookingResult.insertId;
 
@@ -503,13 +585,13 @@ app.post('/api/bookings', async (req, res) => {
 
         if (isInstallment) {
             const remainingAmount = parseFloat(total_price) - parseFloat(downpayment);
-            const installmentAmount = parseFloat((remainingAmount / cycles).toFixed(2));
+            const installmentAmounts = splitAmountEvenly(remainingAmount, cycles);
             for (let i = 1; i <= cycles; i++) {
                 const dueDate = new Date(booking_date);
                 dueDate.setMonth(dueDate.getMonth() + i);
                 await conn.execute(
                     'INSERT INTO installment (amount_due, amount_paid, due_date, status, client_plot_id) VALUES (?, 0.00, ?, ?, ?)',
-                    [installmentAmount, dueDate.toISOString().split('T')[0], 'Pending', bookingId]
+                    [installmentAmounts[i - 1], dueDate.toISOString().split('T')[0], 'Pending', bookingId]
                 );
             }
         }
@@ -555,6 +637,99 @@ app.post('/api/bookings', async (req, res) => {
     }
 });
 
+// --- PURCHASE BOOKING (mirrors /api/bookings, reversed wallet direction) ---
+
+app.post('/api/purchases', async (req, res) => {
+    const conn = await db.getConnection();
+    try {
+        const {
+            total_price,
+            downpayment,
+            agreed_commission,
+            booking_date,
+            cycles,
+            client_id,
+            plot_id,
+            user_id,
+            payment_method = 'cash',
+        } = req.body;
+
+        const isInstallment = cycles && cycles > 0;
+        const amountNow = isInstallment ? parseFloat(downpayment) : parseFloat(total_price);
+
+        await conn.beginTransaction();
+
+        const [plotCheck] = await conn.execute('SELECT is_sold FROM plot WHERE id = ?', [plot_id]);
+        if (plotCheck.length === 0) throw new Error('Plot not found');
+        if (plotCheck[0].is_sold) throw new Error('Plot not available for purchase — already sold or mid-purchase');
+
+        const [wallet] = await conn.execute(
+            'SELECT id, bank_balance, cash_balance FROM wallet WHERE organization_id = (SELECT organization_id FROM app_user WHERE id = ?)',
+            [user_id]
+        );
+        if (wallet.length === 0) throw new Error('No wallet found');
+        const walletId = wallet[0].id;
+        const subBalanceCol = payment_method === 'bank' ? 'bank_balance' : 'cash_balance';
+        const availableBalance = parseFloat(wallet[0][subBalanceCol]);
+
+        if (amountNow > availableBalance) {
+            throw new Error(`Insufficient ${payment_method} balance. Available: Rs ${availableBalance.toLocaleString()}, Required: Rs ${amountNow.toLocaleString()}`);
+        }
+
+        const [bookingResult] = await conn.execute(
+            'INSERT INTO client_plot (total_price, downpayment, agreed_commission, booking_date, cycles, client_id, plot_id, user_id, booking_type, payment_method) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [total_price, downpayment, agreed_commission, booking_date, cycles ?? 0, client_id, plot_id, user_id, 'purchase', payment_method]
+        );
+        const bookingId = bookingResult.insertId;
+
+        // Installment purchase: lock the plot from being sold until fully paid off.
+        // Full-payment purchase: plot stays available (is_sold already FALSE) for immediate resale.
+        if (isInstallment) {
+            await conn.execute('UPDATE plot SET is_sold = TRUE WHERE id = ?', [plot_id]);
+
+            const remainingAmount = parseFloat(total_price) - parseFloat(downpayment);
+            const installmentAmounts = splitAmountEvenly(remainingAmount, cycles);
+            for (let i = 1; i <= cycles; i++) {
+                const dueDate = new Date(booking_date);
+                dueDate.setMonth(dueDate.getMonth() + i);
+                await conn.execute(
+                    'INSERT INTO installment (amount_due, amount_paid, due_date, status, client_plot_id) VALUES (?, 0.00, ?, ?, ?)',
+                    [installmentAmounts[i - 1], dueDate.toISOString().split('T')[0], 'Pending', bookingId]
+                );
+            }
+        }
+
+        const [clientRow] = await conn.execute('SELECT name FROM client WHERE id = ?', [client_id]);
+        const [plotRow] = await conn.execute('SELECT name FROM plot WHERE id = ?', [plot_id]);
+        const clientName = clientRow[0]?.name || 'Unknown';
+        const plotName = plotRow[0]?.name || 'Unknown';
+
+        await conn.execute(
+            'INSERT INTO wallet_transaction (amount, transaction_type, description, wallet_id, user_id, payment_method) VALUES (?, ?, ?, ?, ?, ?)',
+            [amountNow, 'debit', `Purchase - ${clientName} - Plot ${plotName}`, walletId, user_id, payment_method]
+        );
+
+        await conn.execute(
+            `UPDATE wallet SET balance = balance - ?, ${subBalanceCol} = ${subBalanceCol} - ? WHERE id = ?`,
+            [amountNow, amountNow, walletId]
+        );
+
+        await conn.commit();
+
+        res.status(201).json({
+            id: bookingId,
+            message: isInstallment
+                ? `Purchase booked with ${cycles} installments generated.`
+                : 'Purchase completed with full payment.',
+        });
+    } catch (error) {
+        await conn.rollback();
+        res.status(400).json({ error: error.message });
+    } finally {
+        conn.release();
+    }
+});
+
 // PUT /api/bookings/:id
 // Updates booking_date, total_price, downpayment.
 // Recalculates amount_due on all Pending/Partial installments automatically.
@@ -587,12 +762,12 @@ app.put('/api/bookings/:id', async (req, res) => {
                     .reduce((sum, i) => sum + parseFloat(i.amount_paid), 0);
 
                 const remaining = parseFloat(total_price) - parseFloat(downpayment) - paidInstTotal;
-                const newInstAmount = parseFloat((remaining / pendingInsts.length).toFixed(2));
+                const newAmounts = splitAmountEvenly(remaining, pendingInsts.length);
 
-                for (const inst of pendingInsts) {
+                for (let idx = 0; idx < pendingInsts.length; idx++) {
                     await conn.execute(
                         'UPDATE installment SET amount_due = ? WHERE id = ?',
-                        [newInstAmount, inst.id]
+                        [newAmounts[idx], pendingInsts[idx].id]
                     );
                 }
             }
@@ -616,12 +791,13 @@ app.get('/api/reports', async (req, res) => {
         const [rows] = await db.execute(`
             SELECT
                 cp.id, cp.total_price, cp.downpayment, cp.agreed_commission,
-                cp.booking_date, cp.cycles, cp.is_confirmed,
+                cp.booking_date, cp.cycles, cp.is_confirmed, cp.booking_type, cp.payment_method,
                 c.id AS client_id,
                 c.name AS client_name, c.phone_number AS client_phone, c.cnic AS client_cnic,
                 p.name AS plot_name, p.block AS plot_block, p.size AS plot_size,
                 s.name AS society_name,
                 (SELECT COUNT(*) FROM installment i WHERE i.client_plot_id = cp.id AND i.status = 'Paid') AS paid_count,
+                (SELECT COUNT(*) FROM installment i WHERE i.client_plot_id = cp.id AND i.status = 'Pending') AS pending_count,
                 (SELECT COUNT(*) FROM installment i WHERE i.client_plot_id = cp.id) AS total_count
             FROM client_plot cp
             JOIN client c ON cp.client_id = c.id
@@ -656,16 +832,19 @@ app.get('/api/installments/:client_plot_id', async (req, res) => {
 // amount_due is spread evenly across the remaining Pending/Partial siblings.
 // If this was the last unpaid installment and it's still short, a new
 // installment row is auto-created for the remaining balance, due 1 month later.
+// For purchase-type bookings, the wallet is debited instead of credited, an
+// insufficient-balance check is applied, and the plot is unlocked (is_sold = FALSE)
+// once every installment on the booking is fully paid.
 app.patch('/api/installments/:id/pay', async (req, res) => {
     const conn = await db.getConnection();
     try {
         const { id } = req.params;
-        const { amount_paid, user_id, payment_method = 'cash' } = req.body;
+        const { amount_paid, user_id, payment_method } = req.body;
 
         await conn.beginTransaction();
 
         const [rows] = await conn.execute(`
-            SELECT i.*, c.name as client_name, p.name as plot_name
+            SELECT i.*, c.name as client_name, p.name as plot_name, cp.booking_type, cp.payment_method AS booking_payment_method
             FROM installment i
             JOIN client_plot cp ON i.client_plot_id = cp.id
             JOIN client c ON cp.client_id = c.id
@@ -710,14 +889,16 @@ app.patch('/api/installments/:id/pay', async (req, res) => {
                     [diff, newDueDate, 'Pending', installment.client_plot_id]
                 );
             } else {
-                // Not the last installment: spread the shortfall/surplus evenly across remaining Pending/Partial siblings
+                // Not the last installment: spread the shortfall/surplus evenly across remaining Pending/Partial
+                // siblings, with the final sibling absorbing any rounding remainder so totals stay exact.
                 const siblings = allInsts.filter(
                     (i) => i.id !== parseInt(id) && (i.status === 'Pending' || i.status === 'Partial')
                 );
                 if (siblings.length > 0) {
-                    const share = parseFloat((diff / siblings.length).toFixed(2));
-                    for (const sib of siblings) {
-                        const newDue = Math.max(0, parseFloat(sib.amount_due) + share);
+                    const shares = splitAmountEvenly(diff, siblings.length);
+                    for (let idx = 0; idx < siblings.length; idx++) {
+                        const sib = siblings[idx];
+                        const newDue = Math.max(0, parseFloat(sib.amount_due) + shares[idx]);
                         await conn.execute(
                             'UPDATE installment SET amount_due = ? WHERE id = ?',
                             [newDue, sib.id]
@@ -728,21 +909,46 @@ app.patch('/api/installments/:id/pay', async (req, res) => {
         }
 
         const [wallet] = await conn.execute(
-            'SELECT id FROM wallet WHERE organization_id = (SELECT organization_id FROM app_user WHERE id = ?)',
+            'SELECT id, bank_balance, cash_balance FROM wallet WHERE organization_id = (SELECT organization_id FROM app_user WHERE id = ?)',
             [user_id]
         );
         if (wallet.length === 0) throw new Error('No wallet found');
         const walletId = wallet[0].id;
 
-        const subBalanceCol = payment_method === 'bank' ? 'bank_balance' : 'cash_balance';
+        // Default to the payment method chosen at booking time, unless explicitly overridden
+        const effectivePaymentMethod = payment_method || installment.booking_payment_method || 'cash';
+        const subBalanceCol = effectivePaymentMethod === 'bank' ? 'bank_balance' : 'cash_balance';
+        const isPurchase = installment.booking_type === 'purchase';
+
+        if (isPurchase) {
+            const availableBalance = parseFloat(wallet[0][subBalanceCol]);
+            if (parseFloat(amount_paid) > availableBalance) {
+                throw new Error(`Insufficient ${effectivePaymentMethod} balance. Available: Rs ${availableBalance.toLocaleString()}, Required: Rs ${parseFloat(amount_paid).toLocaleString()}`);
+            }
+        }
+
+        // If this was a purchase installment and all installments for this booking are now Paid,
+        // the plot is fully bought out — unlock it for future sale.
+        if (isPurchase && status === 'Paid') {
+            const [remaining] = await conn.execute(
+                `SELECT COUNT(*) AS cnt FROM installment WHERE client_plot_id = ? AND status != 'Paid'`,
+                [installment.client_plot_id]
+            );
+            if (remaining[0].cnt === 0) {
+                await conn.execute(
+                    'UPDATE plot SET is_sold = FALSE WHERE id = (SELECT plot_id FROM client_plot WHERE id = ?)',
+                    [installment.client_plot_id]
+                );
+            }
+        }
 
         await conn.execute(
             'INSERT INTO wallet_transaction (amount, transaction_type, description, wallet_id, user_id, payment_method) VALUES (?, ?, ?, ?, ?, ?)',
-            [amount_paid, 'credit', `${installment.client_name} - Plot ${installment.plot_name}`, walletId, user_id, payment_method]
+            [amount_paid, isPurchase ? 'debit' : 'credit', `${isPurchase ? 'Purchase - ' : ''}${installment.client_name} - Plot ${installment.plot_name}`, walletId, user_id, effectivePaymentMethod]
         );
 
         await conn.execute(
-            `UPDATE wallet SET balance = balance + ?, ${subBalanceCol} = ${subBalanceCol} + ? WHERE id = ?`,
+            `UPDATE wallet SET balance = balance ${isPurchase ? '-' : '+'} ?, ${subBalanceCol} = ${subBalanceCol} ${isPurchase ? '-' : '+'} ? WHERE id = ?`,
             [amount_paid, amount_paid, walletId]
         );
 
@@ -813,11 +1019,11 @@ app.put('/api/installments/:id', async (req, res) => {
 
                 if (siblings.length > 0) {
                     const siblingTotal = totalRemaining - newAmountDue;
-                    const siblingAmount = parseFloat((siblingTotal / siblings.length).toFixed(2));
-                    for (const sib of siblings) {
+                    const siblingAmounts = splitAmountEvenly(siblingTotal, siblings.length);
+                    for (let idx = 0; idx < siblings.length; idx++) {
                         await conn.execute(
                             'UPDATE installment SET amount_due = ? WHERE id = ?',
-                            [siblingAmount, sib.id]
+                            [siblingAmounts[idx], siblings[idx].id]
                         );
                     }
                 }
