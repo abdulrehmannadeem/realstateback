@@ -25,6 +25,31 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
+// --- FILE UPLOADS (organization logo, client photos) ---
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+
+const logoDir = path.join(__dirname, 'uploads', 'logos');
+const clientDir = path.join(__dirname, 'uploads', 'clients');
+fs.mkdirSync(logoDir, { recursive: true });
+fs.mkdirSync(clientDir, { recursive: true });
+
+// Serve everything in /uploads at http://your-server/uploads/...
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+const logoStorage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, logoDir),
+    filename: (req, file, cb) => cb(null, `org-${req.params.id}-${Date.now()}${path.extname(file.originalname)}`),
+});
+const uploadLogo = multer({ storage: logoStorage });
+
+const clientPhotoStorage = multer.diskStorage({
+    destination: (req, file, cb) => cb(null, clientDir),
+    filename: (req, file, cb) => cb(null, `client-${req.params.id}-${Date.now()}${path.extname(file.originalname)}`),
+});
+const uploadClientPhoto = multer({ storage: clientPhotoStorage });
+
 // Basic test route
 app.get('/', (req, res) => {
     res.send('Backend is running!');
@@ -121,7 +146,7 @@ app.put('/api/users/:id/password', async (req, res) => {
 app.get('/api/organizations/:id', async (req, res) => {
     try {
         const [rows] = await db.execute(
-            'SELECT id, name, contact, address FROM organization WHERE id = ?',
+            'SELECT id, name, contact, address, logo_url FROM organization WHERE id = ?',
             [req.params.id]
         );
         if (rows.length === 0) return res.status(404).json({ message: 'Organization not found' });
@@ -141,6 +166,19 @@ app.put('/api/organizations/:id', async (req, res) => {
         );
         if (result.affectedRows === 0) return res.status(404).json({ message: 'Organization not found' });
         res.json({ message: 'Organization updated successfully' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// --- SETTINGS: Upload organization logo ---
+// Expects multipart/form-data with a single field named "logo"
+app.post('/api/organizations/:id/logo', uploadLogo.single('logo'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+        const logoUrl = `/uploads/logos/${req.file.filename}`;
+        await db.execute('UPDATE organization SET logo_url = ? WHERE id = ?', [logoUrl, req.params.id]);
+        res.json({ logo_url: logoUrl });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -415,7 +453,7 @@ app.get('/api/clients/directory', async (req, res) => {
         const { organization_id } = req.query;
         const [rows] = await db.execute(`
             SELECT
-                c.id, c.name, c.phone_number, c.cnic, c.default_commission,
+                c.id, c.name, c.phone_number, c.cnic, c.default_commission, c.photo_url,
                 COUNT(cp.id) AS active_files
             FROM client c
             LEFT JOIN client_plot cp ON c.id = cp.client_id
@@ -476,6 +514,19 @@ app.put('/api/clients/:id', async (req, res) => {
     }
 });
 
+// --- CLIENTS: Upload client photo ---
+// Expects multipart/form-data with a single field named "photo"
+app.post('/api/clients/:id/photo', uploadClientPhoto.single('photo'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+        const photoUrl = `/uploads/clients/${req.file.filename}`;
+        await db.execute('UPDATE client SET photo_url = ? WHERE id = ?', [photoUrl, req.params.id]);
+        res.json({ photo_url: photoUrl });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.delete('/api/clients/:id', async (req, res) => {
     try {
         const [result] = await db.execute('DELETE FROM client WHERE id = ?', [req.params.id]);
@@ -492,7 +543,7 @@ app.get('/api/sales/form-data', async (req, res) => {
     try {
         const { society_id, organization_id } = req.query;
         const [clients] = await db.execute(
-            'SELECT id, name, phone_number, cnic, default_commission FROM client WHERE organization_id = ?',
+            'SELECT id, name, phone_number, cnic, default_commission, photo_url FROM client WHERE organization_id = ?',
             [organization_id]
         );
         const [societies] = await db.execute(
@@ -525,7 +576,7 @@ app.get('/api/purchases/form-data', async (req, res) => {
     try {
         const { society_id, organization_id } = req.query;
         const [clients] = await db.execute(
-            'SELECT id, name, phone_number, cnic, default_commission FROM client WHERE organization_id = ?',
+            'SELECT id, name, phone_number, cnic, default_commission, photo_url FROM client WHERE organization_id = ?',
             [organization_id]
         );
         const [societies] = await db.execute(
@@ -793,7 +844,7 @@ app.get('/api/reports', async (req, res) => {
                 cp.id, cp.total_price, cp.downpayment, cp.agreed_commission,
                 cp.booking_date, cp.cycles, cp.is_confirmed, cp.booking_type, cp.payment_method,
                 c.id AS client_id,
-                c.name AS client_name, c.phone_number AS client_phone, c.cnic AS client_cnic,
+                c.name AS client_name, c.phone_number AS client_phone, c.cnic AS client_cnic, c.photo_url AS client_photo,
                 p.name AS plot_name, p.block AS plot_block, p.size AS plot_size,
                 s.name AS society_name,
                 (SELECT COUNT(*) FROM installment i WHERE i.client_plot_id = cp.id AND i.status = 'Paid') AS paid_count,
