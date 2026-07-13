@@ -834,6 +834,35 @@ app.put('/api/bookings/:id', async (req, res) => {
     }
 });
 
+// DELETE /api/bookings/:id
+// Removes a mistakenly-created booking: deletes its installment schedule
+// and the booking record itself. Wallet balance and plot status are left
+// untouched — this is a simple record removal, not a financial reversal.
+app.delete('/api/bookings/:id', async (req, res) => {
+    const conn = await db.getConnection();
+    try {
+        const { id } = req.params;
+        await conn.beginTransaction();
+
+        const [bookingRows] = await conn.execute('SELECT id FROM client_plot WHERE id = ?', [id]);
+        if (bookingRows.length === 0) {
+            await conn.rollback();
+            return res.status(404).json({ error: 'Booking not found' });
+        }
+
+        await conn.execute('DELETE FROM installment WHERE client_plot_id = ?', [id]);
+        await conn.execute('DELETE FROM client_plot WHERE id = ?', [id]);
+
+        await conn.commit();
+        res.json({ message: 'Booking deleted successfully.' });
+    } catch (error) {
+        await conn.rollback();
+        res.status(500).json({ error: error.message });
+    } finally {
+        conn.release();
+    }
+});
+
 // --- REPORTS ---
 
 app.get('/api/reports', async (req, res) => {
