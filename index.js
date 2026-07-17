@@ -616,6 +616,7 @@ app.post('/api/bookings', async (req, res) => {
             plot_id,
             user_id,
             payment_method = 'cash',
+            notes = null,
         } = req.body;
 
         const isInstallment = cycles && cycles > 0;
@@ -627,8 +628,8 @@ app.post('/api/bookings', async (req, res) => {
         if (plotCheck[0].is_sold) throw new Error('Plot not available for sale — already sold or purchase installments pending');
 
         const [bookingResult] = await conn.execute(
-            'INSERT INTO client_plot (total_price, downpayment, agreed_commission, booking_date, cycles, client_id, plot_id, user_id, payment_method) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [total_price, downpayment, agreed_commission, booking_date, cycles ?? 0, client_id, plot_id, user_id, payment_method]
+            'INSERT INTO client_plot (total_price, downpayment, agreed_commission, booking_date, cycles, client_id, plot_id, user_id, payment_method, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [total_price, downpayment, agreed_commission, booking_date, cycles ?? 0, client_id, plot_id, user_id, payment_method, notes]
         );
         const bookingId = bookingResult.insertId;
 
@@ -844,71 +845,26 @@ app.delete('/api/bookings/:id', async (req, res) => {
         const { id } = req.params;
         await conn.beginTransaction();
 
-        const [bookingRows] = await conn.execute(
-            `SELECT cp.*, c.name AS client_name, p.name AS plot_name
-             FROM client_plot cp
-             JOIN client c ON cp.client_id = c.id
-             JOIN plot p ON cp.plot_id = p.id
-             WHERE cp.id = ?`,
-            [id]
-        );
+        const [bookingRows] = await conn.execute('SELECT id FROM client_plot WHERE id = ?', [id]);
         if (bookingRows.length === 0) {
             await conn.rollback();
             return res.status(404).json({ error: 'Booking not found' });
-        }
-        const booking = bookingRows[0];
-
-        const [installments] = await conn.execute(
-            'SELECT amount_paid FROM installment WHERE client_plot_id = ?',
-            [id]
-        );
-        const totalInstallmentsPaid = installments.reduce((sum, i) => sum + parseFloat(i.amount_paid), 0);
-        const totalPaidOverall = parseFloat(booking.downpayment) + totalInstallmentsPaid;
-
-        const [wallet] = await conn.execute(
-            'SELECT id FROM wallet WHERE organization_id = (SELECT organization_id FROM app_user WHERE id = ?)',
-            [booking.user_id]
-        );
-        if (wallet.length === 0) throw new Error('No wallet found for reversal');
-        const walletId = wallet[0].id;
-
-        const subBalanceCol = booking.payment_method === 'bank' ? 'bank_balance' : 'cash_balance';
-        const isPurchase = booking.booking_type === 'purchase';
-
-        if (totalPaidOverall > 0) {
-            await conn.execute(
-                'INSERT INTO wallet_transaction (amount, transaction_type, description, wallet_id, user_id, payment_method) VALUES (?, ?, ?, ?, ?, ?)',
-                [
-                    totalPaidOverall,
-                    isPurchase ? 'credit' : 'debit',
-                    `Reversal - Deleted ${isPurchase ? 'purchase' : 'sale'} (${booking.client_name} - Plot ${booking.plot_name})`,
-                    walletId,
-                    booking.user_id,
-                    booking.payment_method,
-                ]
-            );
-
-            const operator = isPurchase ? '+' : '-';
-            await conn.execute(
-                `UPDATE wallet SET balance = balance ${operator} ?, ${subBalanceCol} = ${subBalanceCol} ${operator} ? WHERE id = ?`,
-                [totalPaidOverall, totalPaidOverall, walletId]
-            );
         }
 
         await conn.execute('DELETE FROM installment WHERE client_plot_id = ?', [id]);
         await conn.execute('DELETE FROM client_plot WHERE id = ?', [id]);
 
-        await conn.execute('UPDATE plot SET is_sold = FALSE WHERE id = ?', [booking.plot_id]);
-
         await conn.commit();
-        res.json({ message: 'Booking deleted and its effects reversed successfully.' });
+        res.json({ message: 'Booking deleted successfully.' });
     } catch (error) {
         await conn.rollback();
         res.status(500).json({ error: error.message });
     } finally {
         conn.release();
     }
-});// --- REPORTS ---
+});
+
+// --- REPORTS ---
 
 app.get('/api/reports', async (req, res) => {
     try {
@@ -916,7 +872,7 @@ app.get('/api/reports', async (req, res) => {
         const [rows] = await db.execute(`
             SELECT
                 cp.id, cp.total_price, cp.downpayment, cp.agreed_commission,
-                cp.booking_date, cp.cycles, cp.is_confirmed, cp.booking_type, cp.payment_method,
+                cp.booking_date, cp.cycles, cp.is_confirmed, cp.booking_type, cp.payment_method, cp.notes,
                 c.id AS client_id,
                 c.name AS client_name, c.phone_number AS client_phone, c.cnic AS client_cnic, c.photo_url AS client_photo,
                 p.name AS plot_name, p.block AS plot_block, p.size AS plot_size,
