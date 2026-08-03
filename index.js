@@ -336,6 +336,8 @@ app.put('/api/societies/:id', async (req, res) => {
 
 app.delete('/api/societies/:id', async (req, res) => {
     try {
+        const [plots] = await db.execute('SELECT COUNT(*) AS count FROM plot WHERE society_id = ?', [req.params.id]);
+        if (plots[0].count > 0) return res.status(409).json({ message: 'This society has plots. Delete or move its plots first.' });
         const [result] = await db.execute('DELETE FROM society WHERE id = ?', [req.params.id]);
         if (result.affectedRows === 0) return res.status(404).json({ message: 'Society not found' });
         res.json({ message: 'Society deleted successfully' });
@@ -412,6 +414,8 @@ app.put('/api/plots/:id', async (req, res) => {
 
 app.delete('/api/plots/:id', async (req, res) => {
     try {
+        const [bookings] = await db.execute('SELECT COUNT(*) AS count FROM client_plot WHERE plot_id = ?', [req.params.id]);
+        if (bookings[0].count > 0) return res.status(409).json({ message: 'This plot has a sale or purchase record and cannot be deleted. Remove the booking first.' });
         const [result] = await db.execute('DELETE FROM plot WHERE id = ?', [req.params.id]);
         if (result.affectedRows === 0) return res.status(404).json({ message: 'Plot not found' });
         res.json({ message: 'Plot deleted successfully' });
@@ -531,6 +535,8 @@ app.post('/api/clients/:id/photo', uploadClientPhoto.single('photo'), async (req
 
 app.delete('/api/clients/:id', async (req, res) => {
     try {
+        const [bookings] = await db.execute('SELECT COUNT(*) AS count FROM client_plot WHERE client_id = ?', [req.params.id]);
+        if (bookings[0].count > 0) return res.status(409).json({ message: 'This client has sale or purchase records and cannot be deleted. Remove those bookings first.' });
         const [result] = await db.execute('DELETE FROM client WHERE id = ?', [req.params.id]);
         if (result.affectedRows === 0) return res.status(404).json({ message: 'Client not found' });
         res.json({ message: 'Client deleted successfully' });
