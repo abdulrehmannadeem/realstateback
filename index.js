@@ -424,20 +424,21 @@ app.delete('/api/plots/:id', async (req, res) => {
 
 app.post('/api/clients', async (req, res) => {
     try {
-        const { name, phone_number, cnic, default_commission, organization_id } = req.body;
+        const { name, phone_number, cnic, organization_id, city, interests = [] } = req.body;
+        if (!name?.trim() || !phone_number?.trim()) return res.status(400).json({ message: 'Client name and phone number are required.' });
         const [existing] = await db.execute(
-            'SELECT id FROM client WHERE name = ? OR phone_number = ? OR cnic = ?',
-            [name, phone_number, cnic]
+            'SELECT id FROM client WHERE organization_id = ? AND (name = ? OR phone_number = ? OR (? IS NOT NULL AND cnic = ?))',
+            [organization_id, name, phone_number, cnic || null, cnic || null]
         );
         if (existing.length > 0) {
             return res.status(400).json({ message: 'A client with the same name, phone number, or CNIC already exists.' });
         }
         const [result] = await db.execute(
-            'INSERT INTO client (name, phone_number, cnic, default_commission, organization_id) VALUES (?, ?, ?, ?, ?)',
-            [name, phone_number, cnic, default_commission, organization_id]
+            'INSERT INTO client (name, phone_number, cnic, organization_id, city, interests) VALUES (?, ?, ?, ?, ?, ?)',
+            [name.trim(), phone_number.trim(), cnic || null, organization_id, city?.trim() || null, JSON.stringify(interests)]
         );
         res.status(201).json({
-            id: result.insertId, name, phone_number, cnic, default_commission, organization_id
+            id: result.insertId, name, phone_number, cnic, organization_id, city, interests
         });
     } catch (error) {
         if (error.code === 'ER_DUP_ENTRY') {
@@ -453,7 +454,7 @@ app.get('/api/clients/directory', async (req, res) => {
         const { organization_id } = req.query;
         const [rows] = await db.execute(`
             SELECT
-                c.id, c.name, c.phone_number, c.cnic, c.default_commission, c.photo_url,
+                c.id, c.name, c.phone_number, c.cnic, c.photo_url, c.city, c.interests,
                 COUNT(cp.id) AS active_files
             FROM client c
             LEFT JOIN client_plot cp ON c.id = cp.client_id
@@ -502,10 +503,11 @@ app.get('/api/clients', async (req, res) => {
 
 app.put('/api/clients/:id', async (req, res) => {
     try {
-        const { name, phone_number, cnic, default_commission } = req.body;
+        const { name, phone_number, cnic, city, interests = [] } = req.body;
+        if (!name?.trim() || !phone_number?.trim()) return res.status(400).json({ message: 'Client name and phone number are required.' });
         const [result] = await db.execute(
-            'UPDATE client SET name = ?, phone_number = ?, cnic = ?, default_commission = ? WHERE id = ?',
-            [name, phone_number, cnic, default_commission, req.params.id]
+            'UPDATE client SET name = ?, phone_number = ?, cnic = ?, city = ?, interests = ? WHERE id = ?',
+            [name.trim(), phone_number.trim(), cnic || null, city?.trim() || null, JSON.stringify(interests), req.params.id]
         );
         if (result.affectedRows === 0) return res.status(404).json({ message: 'Client not found' });
         res.json({ message: 'Client updated successfully' });
@@ -543,7 +545,7 @@ app.get('/api/sales/form-data', async (req, res) => {
     try {
         const { society_id, organization_id } = req.query;
         const [clients] = await db.execute(
-            'SELECT id, name, phone_number, cnic, default_commission, photo_url FROM client WHERE organization_id = ?',
+            'SELECT id, name, phone_number, cnic, photo_url FROM client WHERE organization_id = ?',
             [organization_id]
         );
         const [societies] = await db.execute(
@@ -576,7 +578,7 @@ app.get('/api/purchases/form-data', async (req, res) => {
     try {
         const { society_id, organization_id } = req.query;
         const [clients] = await db.execute(
-            'SELECT id, name, phone_number, cnic, default_commission, photo_url FROM client WHERE organization_id = ?',
+            'SELECT id, name, phone_number, cnic, photo_url FROM client WHERE organization_id = ?',
             [organization_id]
         );
         const [societies] = await db.execute(
