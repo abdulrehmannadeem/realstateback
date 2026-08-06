@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const db = require('./config/db');
 const bcrypt = require('bcrypt');
+const crypto = require('crypto');
 
 // Splits `total` into `count` currency-safe (2-decimal) parts that always sum
 // exactly to `total` — the last part absorbs any rounding remainder. This
@@ -22,8 +23,27 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Middleware
-app.use(cors());
+app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
+
+const GUEST_SESSION_DAYS = 90;
+const parseCookies = (request) => Object.fromEntries((request.headers.cookie || '').split(';').filter(Boolean).map((value) => { const [key, ...rest] = value.trim().split('='); return [key, decodeURIComponent(rest.join('='))]; }));
+const hashToken = (token) => crypto.createHash('sha256').update(token).digest('hex');
+const createPublicToken = () => crypto.randomBytes(32).toString('hex');
+
+async function getGuestOrganization(token) {
+    const [rows] = await db.execute('SELECT id, name, guest_qr_token FROM organization WHERE guest_qr_token = ?', [token]);
+    return rows[0] || null;
+}
+
+async function getGuestInventory(organizationId) {
+    const [rows] = await db.execute(`SELECT p.id, p.name, p.block, p.size, p.base_cost, p.description, s.name AS society_name FROM plot p JOIN society s ON p.society_id = s.id WHERE s.organization_id = ? AND p.is_sold = FALSE ORDER BY s.name, p.block, p.name`, [organizationId]);
+    return rows;
+}
+
+function setGuestCookie(response, token) {
+    response.cookie('estatemaster_guest', token, { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: GUEST_SESSION_DAYS * 24 * 60 * 60 * 1000, path: '/api/guest' });
+}
 
 // --- FILE UPLOADS (organization logo, client photos) ---
 const multer = require('multer');
@@ -53,6 +73,77 @@ const uploadClientPhoto = multer({ storage: clientPhotoStorage });
 // Basic test route
 app.get('/', (req, res) => {
     res.send('Backend is running!');
+});
+
+// --- ORGANISATION QR & PUBLIC GUEST ACCESS ---
+
+app.get('/api/organizations/:id/guest-qr', async (req, res) => {
+    try {
+        const [organizations] = await db.execute('SELECT id, guest_qr_token FROM organization WHERE id = ?', [req.params.id]);
+        if (organizations.length === 0) return res.status(404).json({ message: 'Organization not found' });
+        let token = organizations[0].guest_qr_token;
+        if (!token) {
+            token = createPublicToken();
+            await db.execute('UPDATE organization SET guest_qr_token = ? WHERE id = ?', [token, req.params.id]);
+        }
+        res.json({ token });
+    } catch (error) {
+        res.status(500).json({ message: 'Unable to create QR access token.' });
+    }
+});
+
+app.get('/api/guest/:token', async (req, res) => {
+    try {
+        const organization = await getGuestOrganization(req.params.token);
+        if (!organization) return res.status(404).json({ message: 'This guest QR code is invalid or has expired.' });
+        const sessionToken = parseCookies(req).estatemaster_guest;
+        let guest = null;
+        if (sessionToken) {
+            const [sessions] = await db.execute(`SELECT gc.id, gc.name, gc.phone_number FROM guest_session gs JOIN guest_customer gc ON gc.id = gs.guest_customer_id WHERE gs.organization_id = ? AND gs.token_hash = ? AND gs.expires_at > NOW()`, [organization.id, hashToken(sessionToken)]);
+            guest = sessions[0] || null;
+            if (guest) await db.execute('UPDATE guest_session SET last_seen_at = NOW() WHERE token_hash = ?', [hashToken(sessionToken)]);
+        }
+        res.json({ organization: { name: organization.name }, guest, inventory: guest ? await getGuestInventory(organization.id) : [] });
+    } catch (error) {
+        res.status(500).json({ message: 'Unable to open guest access.' });
+    }
+});
+
+app.post('/api/guest/:token/register', async (req, res) => {
+    try {
+        const organization = await getGuestOrganization(req.params.token);
+        if (!organization) return res.status(404).json({ message: 'This guest QR code is invalid or has expired.' });
+        const { name, phone_number, cnic, city, interests = [] } = req.body;
+        if (!name?.trim() || !phone_number?.trim()) return res.status(400).json({ message: 'Name and phone number are required.' });
+        if (!Array.isArray(interests)) return res.status(400).json({ message: 'Property interests must be a list.' });
+        const cleanCnic = cnic?.trim() || null;
+        // QR visits are identified by phone number. Reuse that client silently.
+        const [clientMatches] = await db.execute('SELECT id FROM client WHERE organization_id = ? AND phone_number = ? LIMIT 1', [organization.id, phone_number.trim()]);
+        let clientId;
+        if (clientMatches.length) {
+            clientId = clientMatches[0].id;
+            await db.execute('UPDATE client SET name = ?, phone_number = ?, cnic = ?, city = ?, interests = ? WHERE id = ?', [name.trim(), phone_number.trim(), cleanCnic, city?.trim() || null, JSON.stringify(interests), clientId]);
+        } else {
+            const [clientResult] = await db.execute('INSERT INTO client (name, phone_number, cnic, organization_id, city, interests) VALUES (?, ?, ?, ?, ?, ?)', [name.trim(), phone_number.trim(), cleanCnic, organization.id, city?.trim() || null, JSON.stringify(interests)]);
+            clientId = clientResult.insertId;
+        }
+        const [matches] = await db.execute('SELECT id FROM guest_customer WHERE organization_id = ? AND phone_number = ? LIMIT 1', [organization.id, phone_number.trim()]);
+        let guestId;
+        if (matches.length) {
+            guestId = matches[0].id;
+            await db.execute('UPDATE guest_customer SET name = ?, phone_number = ?, cnic = ?, client_id = ?, last_seen_at = NOW() WHERE id = ?', [name.trim(), phone_number.trim(), cleanCnic, clientId, guestId]);
+        } else {
+            const [result] = await db.execute('INSERT INTO guest_customer (organization_id, name, phone_number, cnic, client_id) VALUES (?, ?, ?, ?, ?)', [organization.id, name.trim(), phone_number.trim(), cleanCnic, clientId]);
+            guestId = result.insertId;
+        }
+        const rawSessionToken = createPublicToken();
+        await db.execute('INSERT INTO guest_session (organization_id, guest_customer_id, token_hash, expires_at) VALUES (?, ?, ?, DATE_ADD(NOW(), INTERVAL ? DAY))', [organization.id, guestId, hashToken(rawSessionToken), GUEST_SESSION_DAYS]);
+        setGuestCookie(res, rawSessionToken);
+        const [guests] = await db.execute('SELECT id, name, phone_number FROM guest_customer WHERE id = ?', [guestId]);
+        res.status(201).json({ organization: { name: organization.name }, guest: guests[0], inventory: await getGuestInventory(organization.id) });
+    } catch (error) {
+        res.status(500).json({ message: 'Unable to register guest access.' });
+    }
 });
 
 // Simple Login
@@ -431,11 +522,11 @@ app.post('/api/clients', async (req, res) => {
         const { name, phone_number, cnic, organization_id, city, interests = [] } = req.body;
         if (!name?.trim() || !phone_number?.trim()) return res.status(400).json({ message: 'Client name and phone number are required.' });
         const [existing] = await db.execute(
-            'SELECT id FROM client WHERE organization_id = ? AND (name = ? OR phone_number = ? OR (? IS NOT NULL AND cnic = ?))',
-            [organization_id, name, phone_number, cnic || null, cnic || null]
+            'SELECT id, name FROM client WHERE organization_id = ? AND phone_number = ? LIMIT 1',
+            [organization_id, phone_number.trim()]
         );
         if (existing.length > 0) {
-            return res.status(400).json({ message: 'A client with the same name, phone number, or CNIC already exists.' });
+            return res.status(409).json({ message: `${existing[0].name} already exists for this phone number.` });
         }
         const [result] = await db.execute(
             'INSERT INTO client (name, phone_number, cnic, organization_id, city, interests) VALUES (?, ?, ?, ?, ?, ?)',
@@ -446,7 +537,7 @@ app.post('/api/clients', async (req, res) => {
         });
     } catch (error) {
         if (error.code === 'ER_DUP_ENTRY') {
-            return res.status(400).json({ message: 'A client with this CNIC already exists.' });
+            return res.status(409).json({ message: 'A client with this phone number already exists.' });
         }
         res.status(500).json({ error: error.message });
     }
