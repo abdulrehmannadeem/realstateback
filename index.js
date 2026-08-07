@@ -19,6 +19,28 @@ function splitAmountEvenly(total, count) {
     return parts;
 }
 
+// Loads an organization's custom price brackets, cheapest first.
+async function getPriceCategories(organizationId) {
+    const [rows] = await db.execute(
+        'SELECT id, name, max_price FROM price_category WHERE organization_id = ? ORDER BY max_price ASC',
+        [organizationId]
+    );
+    return rows;
+}
+
+// Assigns an asset to the smallest bracket whose max_price covers its base_cost.
+// Anything above every defined bracket is labeled "Above <highest max_price>".
+function computePriceCategory(baseCost, categories) {
+    const cost = parseFloat(baseCost);
+    for (const cat of categories) {
+        if (cost <= parseFloat(cat.max_price)) return cat.name;
+    }
+    if (categories.length > 0) {
+        return `Above ${parseFloat(categories[categories.length - 1].max_price).toLocaleString()}`;
+    }
+    return null;
+}
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -428,7 +450,8 @@ app.put('/api/societies/:id', async (req, res) => {
 app.delete('/api/societies/:id', async (req, res) => {
     try {
         const [plots] = await db.execute('SELECT COUNT(*) AS count FROM plot WHERE society_id = ?', [req.params.id]);
-        if (plots[0].count > 0) return res.status(409).json({ message: 'This society has plots. Delete or move its plots first.' });
+        const [houses] = await db.execute('SELECT COUNT(*) AS count FROM house WHERE society_id = ?', [req.params.id]);
+        if (plots[0].count > 0 || houses[0].count > 0) return res.status(409).json({ message: 'This society has plots or houses. Delete or move them first.' });
         const [result] = await db.execute('DELETE FROM society WHERE id = ?', [req.params.id]);
         if (result.affectedRows === 0) return res.status(404).json({ message: 'Society not found' });
         res.json({ message: 'Society deleted successfully' });
@@ -483,7 +506,8 @@ app.get('/api/plots', async (req, res) => {
              WHERE s.organization_id = ?`,
             [organization_id]
         );
-        res.json(rows);
+        const categories = await getPriceCategories(organization_id);
+        res.json(rows.map((row) => ({ ...row, price_category: computePriceCategory(row.base_cost, categories) })));
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -510,6 +534,134 @@ app.delete('/api/plots/:id', async (req, res) => {
         const [result] = await db.execute('DELETE FROM plot WHERE id = ?', [req.params.id]);
         if (result.affectedRows === 0) return res.status(404).json({ message: 'Plot not found' });
         res.json({ message: 'Plot deleted successfully' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// --- HOUSE ENDPOINTS ---
+
+app.post('/api/houses', async (req, res) => {
+    try {
+        const { name, block, size, base_cost, description, society_id } = req.body;
+        const [existing] = await db.execute(
+            'SELECT id FROM house WHERE name = ? AND block = ? AND society_id = ?',
+            [name, block, society_id]
+        );
+        if (existing.length > 0) {
+            return res.status(400).json({ error: 'A house with the same number and block already exists in this society.' });
+        }
+        const [result] = await db.execute(
+            'INSERT INTO house (name, block, size, base_cost, description, society_id) VALUES (?, ?, ?, ?, ?, ?)',
+            [name, block, size, base_cost, description, society_id]
+        );
+        res.status(201).json({
+            id: result.insertId, name, block, size, base_cost, is_sold: 0, description, society_id
+        });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/houses', async (req, res) => {
+    try {
+        const { organization_id } = req.query;
+        const [rows] = await db.execute(
+            `SELECT h.*,
+                CASE
+                    WHEN h.is_sold = FALSE THEN 'available'
+                    WHEN EXISTS (
+                        SELECT 1 FROM client_plot cp
+                        WHERE cp.house_id = h.id AND cp.booking_type = 'purchase'
+                        AND EXISTS (
+                            SELECT 1 FROM installment i
+                            WHERE i.client_plot_id = cp.id AND i.status != 'Paid'
+                        )
+                    ) THEN 'purchased'
+                    ELSE 'sold'
+                END AS status
+             FROM house h
+             JOIN society s ON h.society_id = s.id
+             WHERE s.organization_id = ?`,
+            [organization_id]
+        );
+        const categories = await getPriceCategories(organization_id);
+        res.json(rows.map((row) => ({ ...row, price_category: computePriceCategory(row.base_cost, categories) })));
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.put('/api/houses/:id', async (req, res) => {
+    try {
+        const { name, block, size, base_cost, is_sold, description } = req.body;
+        const [result] = await db.execute(
+            'UPDATE house SET name = ?, block = ?, size = ?, base_cost = ?, is_sold = ?, description = ? WHERE id = ?',
+            [name, block, size, base_cost, is_sold, description, req.params.id]
+        );
+        if (result.affectedRows === 0) return res.status(404).json({ message: 'House not found' });
+        res.json({ message: 'House updated successfully' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/api/houses/:id', async (req, res) => {
+    try {
+        const [bookings] = await db.execute('SELECT COUNT(*) AS count FROM client_plot WHERE house_id = ?', [req.params.id]);
+        if (bookings[0].count > 0) return res.status(409).json({ message: 'This house has a sale or purchase record and cannot be deleted. Remove the booking first.' });
+        const [result] = await db.execute('DELETE FROM house WHERE id = ?', [req.params.id]);
+        if (result.affectedRows === 0) return res.status(404).json({ message: 'House not found' });
+        res.json({ message: 'House deleted successfully' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// --- PRICE CATEGORY ENDPOINTS (org-defined price brackets, auto-applied to Plots & Houses) ---
+
+app.post('/api/price-categories', async (req, res) => {
+    try {
+        const { name, max_price, organization_id } = req.body;
+        const [result] = await db.execute(
+            'INSERT INTO price_category (name, max_price, organization_id) VALUES (?, ?, ?)',
+            [name, max_price, organization_id]
+        );
+        res.status(201).json({ id: result.insertId, name, max_price, organization_id });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/price-categories', async (req, res) => {
+    try {
+        const { organization_id } = req.query;
+        const categories = await getPriceCategories(organization_id);
+        res.json(categories);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.put('/api/price-categories/:id', async (req, res) => {
+    try {
+        const { name, max_price } = req.body;
+        const [result] = await db.execute(
+            'UPDATE price_category SET name = ?, max_price = ? WHERE id = ?',
+            [name, max_price, req.params.id]
+        );
+        if (result.affectedRows === 0) return res.status(404).json({ message: 'Price category not found' });
+        res.json({ message: 'Price category updated successfully' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/api/price-categories/:id', async (req, res) => {
+    try {
+        const [result] = await db.execute('DELETE FROM price_category WHERE id = ?', [req.params.id]);
+        if (result.affectedRows === 0) return res.status(404).json({ message: 'Price category not found' });
+        res.json({ message: 'Price category deleted successfully' });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -571,13 +723,15 @@ app.get('/api/clients/:id/bookings', async (req, res) => {
                 cp.downpayment,
                 cp.booking_date,
                 cp.cycles,
-                p.name AS plot_name,
-                p.block AS plot_block,
-                p.size AS plot_size,
+                COALESCE(p.name, h.name) AS plot_name,
+                COALESCE(p.block, h.block) AS plot_block,
+                COALESCE(p.size, h.size) AS plot_size,
+                IF(cp.house_id IS NOT NULL, 'house', 'plot') AS asset_type,
                 s.name AS society_name
             FROM client_plot cp
-            JOIN plot p ON cp.plot_id = p.id
-            JOIN society s ON p.society_id = s.id
+            LEFT JOIN plot p ON cp.plot_id = p.id
+            LEFT JOIN house h ON cp.house_id = h.id
+            JOIN society s ON s.id = COALESCE(p.society_id, h.society_id)
             WHERE cp.client_id = ?
             ORDER BY cp.booking_date DESC
         `, [req.params.id]);
@@ -649,10 +803,14 @@ app.get('/api/sales/form-data', async (req, res) => {
             'SELECT id, name, city FROM society WHERE organization_id = ?',
             [organization_id]
         );
-        let plots;
+        let plots, houses;
         if (society_id) {
             [plots] = await db.execute(
                 'SELECT id, name, block, size, base_cost FROM plot WHERE society_id = ? AND is_sold = FALSE',
+                [society_id]
+            );
+            [houses] = await db.execute(
+                'SELECT id, name, block, size, base_cost FROM house WHERE society_id = ? AND is_sold = FALSE',
                 [society_id]
             );
         } else {
@@ -662,8 +820,17 @@ app.get('/api/sales/form-data', async (req, res) => {
                  WHERE s.organization_id = ? AND p.is_sold = FALSE`,
                 [organization_id]
             );
+            [houses] = await db.execute(
+                `SELECT h.id, h.name, h.block, h.size, h.base_cost FROM house h
+                 JOIN society s ON h.society_id = s.id
+                 WHERE s.organization_id = ? AND h.is_sold = FALSE`,
+                [organization_id]
+            );
         }
-        res.json({ clients, societies, plots });
+        const categories = await getPriceCategories(organization_id);
+        plots = plots.map((p) => ({ ...p, price_category: computePriceCategory(p.base_cost, categories) }));
+        houses = houses.map((h) => ({ ...h, price_category: computePriceCategory(h.base_cost, categories) }));
+        res.json({ clients, societies, plots, houses });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -682,10 +849,14 @@ app.get('/api/purchases/form-data', async (req, res) => {
             'SELECT id, name, city FROM society WHERE organization_id = ?',
             [organization_id]
         );
-        let plots;
+        let plots, houses;
         if (society_id) {
             [plots] = await db.execute(
                 'SELECT id, name, block, size, base_cost FROM plot WHERE society_id = ? AND is_sold = FALSE',
+                [society_id]
+            );
+            [houses] = await db.execute(
+                'SELECT id, name, block, size, base_cost FROM house WHERE society_id = ? AND is_sold = FALSE',
                 [society_id]
             );
         } else {
@@ -695,8 +866,17 @@ app.get('/api/purchases/form-data', async (req, res) => {
                  WHERE s.organization_id = ? AND p.is_sold = FALSE`,
                 [organization_id]
             );
+            [houses] = await db.execute(
+                `SELECT h.id, h.name, h.block, h.size, h.base_cost FROM house h
+                 JOIN society s ON h.society_id = s.id
+                 WHERE s.organization_id = ? AND h.is_sold = FALSE`,
+                [organization_id]
+            );
         }
-        res.json({ clients, societies, plots });
+        const categories = await getPriceCategories(organization_id);
+        plots = plots.map((p) => ({ ...p, price_category: computePriceCategory(p.base_cost, categories) }));
+        houses = houses.map((h) => ({ ...h, price_category: computePriceCategory(h.base_cost, categories) }));
+        res.json({ clients, societies, plots, houses });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -713,26 +893,32 @@ app.post('/api/bookings', async (req, res) => {
             cycles,
             client_id,
             plot_id,
+            house_id,
             user_id,
             payment_method = 'cash',
             notes = null,
         } = req.body;
 
+        const assetTable = house_id ? 'house' : 'plot';
+        const assetId = house_id || plot_id;
+        const assetLabel = house_id ? 'House' : 'Plot';
+        if (!assetId) throw new Error('Either plot_id or house_id is required');
+
         const isInstallment = cycles && cycles > 0;
 
         await conn.beginTransaction();
 
-        const [plotCheck] = await conn.execute('SELECT is_sold FROM plot WHERE id = ?', [plot_id]);
-        if (plotCheck.length === 0) throw new Error('Plot not found');
-        if (plotCheck[0].is_sold) throw new Error('Plot not available for sale — already sold or purchase installments pending');
+        const [assetCheck] = await conn.execute(`SELECT is_sold FROM ${assetTable} WHERE id = ?`, [assetId]);
+        if (assetCheck.length === 0) throw new Error(`${assetLabel} not found`);
+        if (assetCheck[0].is_sold) throw new Error(`${assetLabel} not available for sale — already sold or purchase installments pending`);
 
         const [bookingResult] = await conn.execute(
-            'INSERT INTO client_plot (total_price, downpayment, agreed_commission, booking_date, cycles, client_id, plot_id, user_id, payment_method, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [total_price, downpayment, agreed_commission, booking_date, cycles ?? 0, client_id, plot_id, user_id, payment_method, notes]
+            'INSERT INTO client_plot (total_price, downpayment, agreed_commission, booking_date, cycles, client_id, plot_id, house_id, user_id, payment_method, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [total_price, downpayment, agreed_commission, booking_date, cycles ?? 0, client_id, plot_id || null, house_id || null, user_id, payment_method, notes]
         );
         const bookingId = bookingResult.insertId;
 
-        await conn.execute('UPDATE plot SET is_sold = TRUE WHERE id = ?', [plot_id]);
+        await conn.execute(`UPDATE ${assetTable} SET is_sold = TRUE WHERE id = ?`, [assetId]);
 
         if (isInstallment) {
             const remainingAmount = parseFloat(total_price) - parseFloat(downpayment);
@@ -755,16 +941,16 @@ app.post('/api/bookings', async (req, res) => {
         const walletId = wallet[0].id;
 
         const [clientRow] = await conn.execute('SELECT name FROM client WHERE id = ?', [client_id]);
-        const [plotRow] = await conn.execute('SELECT name FROM plot WHERE id = ?', [plot_id]);
+        const [assetRow] = await conn.execute(`SELECT name FROM ${assetTable} WHERE id = ?`, [assetId]);
         const clientName = clientRow[0]?.name || 'Unknown';
-        const plotName = plotRow[0]?.name || 'Unknown';
+        const assetName = assetRow[0]?.name || 'Unknown';
 
         const txAmount = isInstallment ? downpayment : total_price;
         const subBalanceCol = payment_method === 'bank' ? 'bank_balance' : 'cash_balance';
 
         await conn.execute(
             'INSERT INTO wallet_transaction (amount, transaction_type, description, wallet_id, user_id, payment_method) VALUES (?, ?, ?, ?, ?, ?)',
-            [txAmount, 'credit', `${clientName} - Plot ${plotName}`, walletId, user_id, payment_method]
+            [txAmount, 'credit', `${clientName} - ${assetLabel} ${assetName}`, walletId, user_id, payment_method]
         );
 
         await conn.execute(
@@ -801,18 +987,24 @@ app.post('/api/purchases', async (req, res) => {
             cycles,
             client_id,
             plot_id,
+            house_id,
             user_id,
             payment_method = 'cash',
         } = req.body;
+
+        const assetTable = house_id ? 'house' : 'plot';
+        const assetId = house_id || plot_id;
+        const assetLabel = house_id ? 'House' : 'Plot';
+        if (!assetId) throw new Error('Either plot_id or house_id is required');
 
         const isInstallment = cycles && cycles > 0;
         const amountNow = isInstallment ? parseFloat(downpayment) : parseFloat(total_price);
 
         await conn.beginTransaction();
 
-        const [plotCheck] = await conn.execute('SELECT is_sold FROM plot WHERE id = ?', [plot_id]);
-        if (plotCheck.length === 0) throw new Error('Plot not found');
-        if (plotCheck[0].is_sold) throw new Error('Plot not available for purchase — already sold or mid-purchase');
+        const [assetCheck] = await conn.execute(`SELECT is_sold FROM ${assetTable} WHERE id = ?`, [assetId]);
+        if (assetCheck.length === 0) throw new Error(`${assetLabel} not found`);
+        if (assetCheck[0].is_sold) throw new Error(`${assetLabel} not available for purchase — already sold or mid-purchase`);
 
         const [wallet] = await conn.execute(
             'SELECT id, bank_balance, cash_balance FROM wallet WHERE organization_id = (SELECT organization_id FROM app_user WHERE id = ?)',
@@ -828,15 +1020,15 @@ app.post('/api/purchases', async (req, res) => {
         }
 
         const [bookingResult] = await conn.execute(
-            'INSERT INTO client_plot (total_price, downpayment, agreed_commission, booking_date, cycles, client_id, plot_id, user_id, booking_type, payment_method) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-            [total_price, downpayment, agreed_commission, booking_date, cycles ?? 0, client_id, plot_id, user_id, 'purchase', payment_method]
+            'INSERT INTO client_plot (total_price, downpayment, agreed_commission, booking_date, cycles, client_id, plot_id, house_id, user_id, booking_type, payment_method) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            [total_price, downpayment, agreed_commission, booking_date, cycles ?? 0, client_id, plot_id || null, house_id || null, user_id, 'purchase', payment_method]
         );
         const bookingId = bookingResult.insertId;
 
-        // Installment purchase: lock the plot from being sold until fully paid off.
-        // Full-payment purchase: plot stays available (is_sold already FALSE) for immediate resale.
+        // Installment purchase: lock the asset from being sold until fully paid off.
+        // Full-payment purchase: asset stays available (is_sold already FALSE) for immediate resale.
         if (isInstallment) {
-            await conn.execute('UPDATE plot SET is_sold = TRUE WHERE id = ?', [plot_id]);
+            await conn.execute(`UPDATE ${assetTable} SET is_sold = TRUE WHERE id = ?`, [assetId]);
 
             const remainingAmount = parseFloat(total_price) - parseFloat(downpayment);
             const installmentAmounts = splitAmountEvenly(remainingAmount, cycles);
@@ -851,13 +1043,13 @@ app.post('/api/purchases', async (req, res) => {
         }
 
         const [clientRow] = await conn.execute('SELECT name FROM client WHERE id = ?', [client_id]);
-        const [plotRow] = await conn.execute('SELECT name FROM plot WHERE id = ?', [plot_id]);
+        const [assetRow] = await conn.execute(`SELECT name FROM ${assetTable} WHERE id = ?`, [assetId]);
         const clientName = clientRow[0]?.name || 'Unknown';
-        const plotName = plotRow[0]?.name || 'Unknown';
+        const assetName = assetRow[0]?.name || 'Unknown';
 
         await conn.execute(
             'INSERT INTO wallet_transaction (amount, transaction_type, description, wallet_id, user_id, payment_method) VALUES (?, ?, ?, ?, ?, ?)',
-            [amountNow, 'debit', `Purchase - ${clientName} - Plot ${plotName}`, walletId, user_id, payment_method]
+            [amountNow, 'debit', `Purchase - ${clientName} - ${assetLabel} ${assetName}`, walletId, user_id, payment_method]
         );
 
         await conn.execute(
@@ -936,7 +1128,7 @@ app.put('/api/bookings/:id', async (req, res) => {
 
 // DELETE /api/bookings/:id
 // Removes a mistakenly-created booking: deletes its installment schedule
-// and the booking record itself. Wallet balance and plot status are left
+// and the booking record itself. Wallet balance and asset status are left
 // untouched — this is a simple record removal, not a financial reversal.
 app.delete('/api/bookings/:id', async (req, res) => {
     const conn = await db.getConnection();
@@ -974,15 +1166,19 @@ app.get('/api/reports', async (req, res) => {
                 cp.booking_date, cp.cycles, cp.is_confirmed, cp.booking_type, cp.payment_method, cp.notes,
                 c.id AS client_id,
                 c.name AS client_name, c.phone_number AS client_phone, c.cnic AS client_cnic, c.photo_url AS client_photo,
-                p.name AS plot_name, p.block AS plot_block, p.size AS plot_size,
+                COALESCE(p.name, h.name) AS plot_name,
+                COALESCE(p.block, h.block) AS plot_block,
+                COALESCE(p.size, h.size) AS plot_size,
+                IF(cp.house_id IS NOT NULL, 'house', 'plot') AS asset_type,
                 s.name AS society_name,
                 (SELECT COUNT(*) FROM installment i WHERE i.client_plot_id = cp.id AND i.status = 'Paid') AS paid_count,
                 (SELECT COUNT(*) FROM installment i WHERE i.client_plot_id = cp.id AND i.status = 'Pending') AS pending_count,
                 (SELECT COUNT(*) FROM installment i WHERE i.client_plot_id = cp.id) AS total_count
             FROM client_plot cp
             JOIN client c ON cp.client_id = c.id
-            JOIN plot p ON cp.plot_id = p.id
-            JOIN society s ON p.society_id = s.id
+            LEFT JOIN plot p ON cp.plot_id = p.id
+            LEFT JOIN house h ON cp.house_id = h.id
+            JOIN society s ON s.id = COALESCE(p.society_id, h.society_id)
             WHERE c.organization_id = ?
             ORDER BY cp.booking_date DESC
         `, [organization_id]);
@@ -1013,8 +1209,8 @@ app.get('/api/installments/:client_plot_id', async (req, res) => {
 // If this was the last unpaid installment and it's still short, a new
 // installment row is auto-created for the remaining balance, due 1 month later.
 // For purchase-type bookings, the wallet is debited instead of credited, an
-// insufficient-balance check is applied, and the plot is unlocked (is_sold = FALSE)
-// once every installment on the booking is fully paid.
+// insufficient-balance check is applied, and the asset (plot or house) is unlocked
+// (is_sold = FALSE) once every installment on the booking is fully paid.
 app.patch('/api/installments/:id/pay', async (req, res) => {
     const conn = await db.getConnection();
     try {
@@ -1024,11 +1220,13 @@ app.patch('/api/installments/:id/pay', async (req, res) => {
         await conn.beginTransaction();
 
         const [rows] = await conn.execute(`
-            SELECT i.*, c.name as client_name, p.name as plot_name, cp.booking_type, cp.payment_method AS booking_payment_method
+            SELECT i.*, c.name as client_name, COALESCE(p.name, h.name) as plot_name,
+                   cp.booking_type, cp.payment_method AS booking_payment_method, cp.house_id
             FROM installment i
             JOIN client_plot cp ON i.client_plot_id = cp.id
             JOIN client c ON cp.client_id = c.id
-            JOIN plot p ON cp.plot_id = p.id
+            LEFT JOIN plot p ON cp.plot_id = p.id
+            LEFT JOIN house h ON cp.house_id = h.id
             WHERE i.id = ?`, [id]);
 
         if (rows.length === 0) throw new Error('Installment not found');
@@ -1108,15 +1306,17 @@ app.patch('/api/installments/:id/pay', async (req, res) => {
         }
 
         // If this was a purchase installment and all installments for this booking are now Paid,
-        // the plot is fully bought out — unlock it for future sale.
+        // the asset is fully bought out — unlock it for future sale.
         if (isPurchase && status === 'Paid') {
             const [remaining] = await conn.execute(
                 `SELECT COUNT(*) AS cnt FROM installment WHERE client_plot_id = ? AND status != 'Paid'`,
                 [installment.client_plot_id]
             );
             if (remaining[0].cnt === 0) {
+                const assetTable = installment.house_id ? 'house' : 'plot';
+                const assetIdCol = installment.house_id ? 'house_id' : 'plot_id';
                 await conn.execute(
-                    'UPDATE plot SET is_sold = FALSE WHERE id = (SELECT plot_id FROM client_plot WHERE id = ?)',
+                    `UPDATE ${assetTable} SET is_sold = FALSE WHERE id = (SELECT ${assetIdCol} FROM client_plot WHERE id = ?)`,
                     [installment.client_plot_id]
                 );
             }
