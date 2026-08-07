@@ -14,3 +14,4 @@
 - Frontend public guest experience and QR-management screen are implemented; final device-flow verification is pending.
 - QR guest registration now also creates or updates the organisation's normal client record (without a photo); guest-device sessions remain separate.
 - CNIC is optional. The numeric client ID remains the primary key, while `(organization_id, phone_number)` prevents a duplicate client only within the same organisation; QR scans silently reuse that scoped client.
+- Added an Inventory schema migration for the Houses and Price Categories features, including `client_plot.house_id` for house sales and purchases.
