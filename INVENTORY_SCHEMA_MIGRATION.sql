@@ -24,5 +24,5 @@ CREATE TABLE IF NOT EXISTS price_category (
 );
 
 ALTER TABLE client_plot MODIFY COLUMN plot_id INT NULL;
-ALTER TABLE client_plot ADD COLUMN IF NOT EXISTS house_id INT NULL AFTER plot_id;
-ALTER TABLE client_plot ADD INDEX IF NOT EXISTS idx_client_plot_house (house_id);
+ALTER TABLE client_plot ADD COLUMN house_id INT NULL AFTER plot_id;
+ALTER TABLE client_plot ADD INDEX idx_client_plot_house (house_id);
