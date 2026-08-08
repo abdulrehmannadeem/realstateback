@@ -798,6 +798,9 @@ app.delete('/api/clients/:id', async (req, res) => {
     try {
         const [bookings] = await db.execute('SELECT COUNT(*) AS count FROM client_plot WHERE client_id = ?', [req.params.id]);
         if (bookings[0].count > 0) return res.status(409).json({ message: 'This client has sale or purchase records and cannot be deleted. Remove those bookings first.' });
+        // Keep QR visit history, but remove its optional link to the normal client
+        // record so a client without bookings can be deleted.
+        await db.execute('UPDATE guest_customer SET client_id = NULL WHERE client_id = ?', [req.params.id]);
         const [result] = await db.execute('DELETE FROM client WHERE id = ?', [req.params.id]);
         if (result.affectedRows === 0) return res.status(404).json({ message: 'Client not found' });
         res.json({ message: 'Client deleted successfully' });
