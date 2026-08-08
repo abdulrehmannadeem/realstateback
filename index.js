@@ -49,9 +49,12 @@ app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());
 
 const GUEST_SESSION_DAYS = 90;
+const APP_TOKEN_SECRET = process.env.APP_TOKEN_SECRET || 'set-app-token-secret-in-production';
 const parseCookies = (request) => Object.fromEntries((request.headers.cookie || '').split(';').filter(Boolean).map((value) => { const [key, ...rest] = value.trim().split('='); return [key, decodeURIComponent(rest.join('='))]; }));
 const hashToken = (token) => crypto.createHash('sha256').update(token).digest('hex');
 const createPublicToken = () => crypto.randomBytes(32).toString('hex');
+const signAppToken = (data) => { const body = Buffer.from(JSON.stringify({ ...data, exp: Date.now() + 604800000 })).toString('base64url'); return `${body}.${crypto.createHmac('sha256', APP_TOKEN_SECRET).update(body).digest('base64url')}`; };
+const readAppUser = (req) => { const token = req.headers.authorization?.replace(/^Bearer\s+/i, ''); if (!token?.includes('.')) return null; const [body, sig] = token.split('.'); const expected = crypto.createHmac('sha256', APP_TOKEN_SECRET).update(body).digest('base64url'); if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null; try { const data = JSON.parse(Buffer.from(body, 'base64url').toString()); return data.exp > Date.now() ? data : null; } catch { return null; } };
 
 async function getGuestOrganization(token) {
     const [rows] = await db.execute('SELECT id, name, guest_qr_token FROM organization WHERE guest_qr_token = ?', [token]);
@@ -59,7 +62,7 @@ async function getGuestOrganization(token) {
 }
 
 async function getGuestInventory(organizationId) {
-    const [rows] = await db.execute(`SELECT p.id, p.name, p.block, p.size, p.base_cost, p.description, s.name AS society_name FROM plot p JOIN society s ON p.society_id = s.id WHERE s.organization_id = ? AND p.is_sold = FALSE ORDER BY s.name, p.block, p.name`, [organizationId]);
+    const [rows] = await db.execute(`SELECT p.id, p.name, p.block, p.size, p.sale_price, p.description, s.name AS society_name FROM plot p JOIN society s ON p.society_id = s.id WHERE s.organization_id = ? AND p.is_sold = FALSE AND p.is_private = FALSE ORDER BY s.name, p.block, p.name`, [organizationId]);
     return rows;
 }
 
@@ -181,7 +184,7 @@ app.post('/api/users/login', async (req, res) => {
         const match = await bcrypt.compare(password, user.password);
         if (!match) return res.status(401).json({ message: 'Invalid email or password' });
         const { password: _pw, ...safeUser } = user;
-        res.json({ message: 'Login successful', user: safeUser });
+        res.json({ message: 'Login successful', user: safeUser, accessToken: signAppToken({ id: user.id, role: user.role, organization_id: user.organization_id }) });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -464,7 +467,7 @@ app.delete('/api/societies/:id', async (req, res) => {
 
 app.post('/api/plots', async (req, res) => {
     try {
-        const { name, block, size, base_cost, description, society_id } = req.body;
+        const { name, block, size, base_cost, sale_price, is_private = false, description, society_id } = req.body;
         const [existing] = await db.execute(
             'SELECT id FROM plot WHERE name = ? AND block = ? AND society_id = ?',
             [name, block, society_id]
@@ -473,11 +476,11 @@ app.post('/api/plots', async (req, res) => {
             return res.status(400).json({ error: 'A plot with the same number and block already exists in this society.' });
         }
         const [result] = await db.execute(
-            'INSERT INTO plot (name, block, size, base_cost, description, society_id) VALUES (?, ?, ?, ?, ?, ?)',
-            [name, block, size, base_cost, description, society_id]
+            'INSERT INTO plot (name, block, size, base_cost, sale_price, is_private, description, society_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            [name, block, size, base_cost, sale_price || null, Boolean(is_private), description, society_id]
         );
         res.status(201).json({
-            id: result.insertId, name, block, size, base_cost, is_sold: 0, description, society_id
+            id: result.insertId, name, block, size, base_cost, sale_price: sale_price || null, is_private: Boolean(is_private), is_sold: 0, description, society_id
         });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -515,10 +518,10 @@ app.get('/api/plots', async (req, res) => {
 
 app.put('/api/plots/:id', async (req, res) => {
     try {
-        const { name, block, size, base_cost, is_sold, description } = req.body;
+        const { name, block, size, base_cost, sale_price, is_private = false, is_sold, description } = req.body;
         const [result] = await db.execute(
-            'UPDATE plot SET name = ?, block = ?, size = ?, base_cost = ?, is_sold = ?, description = ? WHERE id = ?',
-            [name, block, size, base_cost, is_sold, description, req.params.id]
+            'UPDATE plot SET name = ?, block = ?, size = ?, base_cost = ?, sale_price = ?, is_private = ?, is_sold = ?, description = ? WHERE id = ?',
+            [name, block, size, base_cost, sale_price || null, Boolean(is_private), is_sold, description, req.params.id]
         );
         if (result.affectedRows === 0) return res.status(404).json({ message: 'Plot not found' });
         res.json({ message: 'Plot updated successfully' });
@@ -538,6 +541,19 @@ app.delete('/api/plots/:id', async (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
+
+// Private inventory: every endpoint verifies the signed logged-in user.
+async function adminPlot(req, res) {
+    const user = readAppUser(req); if (!user) { res.status(401).json({ message: 'Please sign in again.' }); return null; }
+    if (user.role !== 'Admin') { res.status(403).json({ message: 'Admin access required.' }); return null; }
+    const [plots] = await db.execute('SELECT p.id FROM plot p JOIN society s ON s.id=p.society_id WHERE p.id=? AND s.organization_id=?', [req.params.id, user.organization_id]);
+    if (!plots.length) { res.status(404).json({ message: 'Plot not found.' }); return null; } return plots[0];
+}
+app.get('/api/plots/:id/stakeholders', async (req,res) => { try { const p=await adminPlot(req,res); if(!p)return; const [rows]=await db.execute('SELECT id,email,ownership_percentage,accepted_at FROM plot_stakeholder WHERE plot_id=?',[p.id]); res.json(rows); } catch { res.status(500).json({message:'Unable to load stakeholders.'}); } });
+app.post('/api/plots/:id/stakeholders', async (req,res) => { try { const p=await adminPlot(req,res); if(!p)return; const email=req.body.email?.trim().toLowerCase(), percentage=Number(req.body.ownership_percentage); if(!email || !Number.isFinite(percentage) || percentage<=0 || percentage>100) return res.status(400).json({message:'Valid email and percentage required.'}); const [tot]=await db.execute('SELECT COALESCE(SUM(ownership_percentage),0) total FROM plot_stakeholder WHERE plot_id=?',[p.id]); if(Number(tot[0].total)+percentage>100)return res.status(400).json({message:'Total ownership cannot exceed 100%.'}); const token=createPublicToken(); const [r]=await db.execute('INSERT INTO plot_stakeholder (plot_id,email,ownership_percentage,invitation_token_hash) VALUES (?,?,?,?)',[p.id,email,percentage,hashToken(token)]); res.status(201).json({id:r.insertId,email,ownership_percentage:percentage,invite_token:token}); } catch(e) { res.status(500).json({message:'Unable to add stakeholder.'}); } });
+app.get('/api/stakeholder-invites/:token', async (req,res) => { try { const [rows]=await db.execute('SELECT ps.email,ps.ownership_percentage,ps.accepted_at,p.name plot_name,p.block,p.size,s.name society_name FROM plot_stakeholder ps JOIN plot p ON p.id=ps.plot_id JOIN society s ON s.id=p.society_id WHERE ps.invitation_token_hash=?',[hashToken(req.params.token)]); if(!rows.length)return res.status(404).json({message:'Invitation is invalid.'});res.json(rows[0]); }catch{res.status(500).json({message:'Unable to open invitation.'});} });
+app.post('/api/stakeholder-invites/:token/activate', async (req,res) => { try { const {name,password}=req.body;if(!name?.trim()||!password||password.length<8)return res.status(400).json({message:'Name and 8-character password required.'}); const [rows]=await db.execute('SELECT ps.id,ps.email,p.society_id FROM plot_stakeholder ps JOIN plot p ON p.id=ps.plot_id WHERE ps.invitation_token_hash=?',[hashToken(req.params.token)]);if(!rows.length)return res.status(404).json({message:'Invitation is invalid.'});const x=rows[0];const [org]=await db.execute('SELECT organization_id FROM society WHERE id=?',[x.society_id]);const [users]=await db.execute('SELECT id,role FROM app_user WHERE email=?',[x.email]);let id;if(users.length){if(users[0].role!=='Stakeholder')return res.status(409).json({message:'Email belongs to a staff account.'});id=users[0].id;}else{const [u]=await db.execute('INSERT INTO app_user (name,email,password,role,organization_id) VALUES (?,?,?,?,?)',[name.trim(),x.email,await bcrypt.hash(password,10),'Stakeholder',org[0].organization_id]);id=u.insertId;}await db.execute('UPDATE plot_stakeholder SET user_id=?,accepted_at=NOW(),invitation_token_hash=NULL WHERE id=?',[id,x.id]);res.json({message:'Account activated. Sign in to view the plot.'});}catch{res.status(500).json({message:'Unable to activate invitation.'});} });
+app.get('/api/private-portfolio', async (req,res) => { try { const u=readAppUser(req);if(!u||u.role!=='Stakeholder')return res.status(403).json({message:'Stakeholder access required.'});const [rows]=await db.execute(`SELECT p.id,p.name,p.block,p.size,p.base_cost,p.sale_price,p.description,s.name society_name,ps.ownership_percentage,(SELECT COUNT(*) FROM client_plot cp WHERE cp.plot_id=p.id) transaction_count,(SELECT COALESCE(SUM(total_price),0) FROM client_plot cp WHERE cp.plot_id=p.id) transaction_total,(SELECT COALESCE(SUM(i.amount_due-i.amount_paid),0) FROM installment i JOIN client_plot cp ON cp.id=i.client_plot_id WHERE cp.plot_id=p.id AND i.status!='Paid') amount_due FROM plot_stakeholder ps JOIN plot p ON p.id=ps.plot_id JOIN society s ON s.id=p.society_id WHERE ps.user_id=? AND ps.accepted_at IS NOT NULL`,[u.id]);res.json(rows);}catch{res.status(500).json({message:'Unable to load portfolio.'});} });
 
 // --- HOUSE ENDPOINTS ---
 
